@@ -29,7 +29,8 @@ The pipeline:
 
 | File              | What it is                                                                  |
 |-------------------|-----------------------------------------------------------------------------|
-| `av-pipeline.yaml`| The full 3-stage pipeline. Single Osmo workflow, ~90 min wall time.         |
+| `av-pipeline.yaml`| The "minimal demo" 3-stage pipeline: 8 Cosmos scenes, 100-step finetune, basic ground-plane eval. ~90 min wall time. Good for first-run validation. |
+| `av-pipeline-robust.yaml` | The "real" pipeline: 100 varied Cosmos scenes (parallelized across 8 GPUs), 2000-step finetune with eff. batch 256, Simple_Warehouse environment, and a forklift that actually drives (joint-specific drive+steer action mapping with `GetActionLayout` RPC for dynamic discovery of wheel/steering joint indices). ~3-3.5 hr wall time. **Use this for a meaningful base-vs-finetuned comparison.** |
 | `eval-smoke.yaml` | Stage-3-only smoke test. Skips cosmos + finetune. ~25 min wall time. Used for fast iteration on the eval task (sim setup, camera angle, video logging, etc.) without re-running 60+ min of upstream stages each time. Pulls a known-good finetuned model from W&B (`wandb-smle/osmo-workflow/groot-av-finetuned:v10`) as a stand-in. |
 
 Both YAMLs are self-contained — every script the tasks run (`generate.py`, `eval_runner.py`, `sim_server.py`, `forklift_nav_env_cfg.py`, etc.) is embedded inline under `files:` so submission is just `osmo workflow submit`.
