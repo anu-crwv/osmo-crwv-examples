@@ -377,6 +377,12 @@ workflow:
               config={"use_reasoner": use_reasoner, "min_score": MIN_SCORE, "n_input": len(ep_ids),
                       "source_artifact": os.environ.get("WANDB_INPUT_ARTIFACT", "")})
 
+          # record the upstream dataset as a W&B input so the lineage edge shows (av-forklift-v1 -> cosmos-cap)
+          try:
+              run.use_artifact(os.environ.get("WANDB_INPUT_ARTIFACT") or "av-forklift-v1:latest", type="dataset")
+          except Exception as _e:
+              print(f"[cap] use_artifact lineage note: {_e}", flush=True)
+
           # ---- caption + score each episode ----
           records, kept = [], []   # kept: list of (src_ep, caption)
           for ep in ep_ids:
