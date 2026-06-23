@@ -2,13 +2,13 @@ version: 2
 default-values:
   max_steps: 6000
   n_episodes: 20
-# av-pipeline-v3.yaml — END-TO-END forklift VLA pipeline with PARALLEL base-vs-finetuned eval
+# av-pipeline.yaml — END-TO-END forklift VLA pipeline with PARALLEL base-vs-finetuned eval
 #   dataset-preprocess -> cosmos-cap -> vla-finetune -> { base-eval || finetuned-eval } -> compare
 # base-eval loads the base GR00T (nvidia/GR00T-N1.6-3B); finetuned-eval loads groot-av-finetuned.
 # Eval uses the real-physics sim (collision via kinematic deck + stop-at-pallet clamp, forks-low,
 # assisted lift). compare reads both summaries and logs the delta to W&B.
 workflow:
-  name: av-pipeline-v3
+  name: av-pipeline
   resources:
     preprocess-gpu:
       platform: gpu
