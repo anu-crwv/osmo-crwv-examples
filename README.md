@@ -1,4 +1,12 @@
-# Physical AI on Osmo + CoreWeave — a forklift VLA pipeline
+<p align="center">
+  <img src="./assets/nvidia-logo-horiz-wht-16x9.png#gh-dark-mode-only" width="600" alt="NVIDIA" style="vertical-align: middle;" />
+  <img src="./assets/nvidia-logo-horiz-blk-16x9.png#gh-light-mode-only" width="600" alt="NVIDIA" style="vertical-align: middle;" />
+  <img src="./assets/Endorsed_primary_goldwhite.png#gh-dark-mode-only" width="600" alt="Weights & Biases" style="vertical-align: middle;" />
+  <img src="./assets/Endorsed_primary_goldblack.png#gh-light-mode-only" width="600" alt="Weights & Biases" style="vertical-align: middle;" />
+</p>
+
+# Physical AI Data Factory with NVIDIA Osmo on CoreWeave — a VLA Finetuning pipeline
+
 
 A reference **Physical AI / robotics pipeline** that takes a real teleop forklift
 dataset all the way to an in-simulation policy evaluation, running end-to-end on
@@ -6,12 +14,13 @@ dataset all the way to an in-simulation policy evaluation, running end-to-end on
 GPU cluster, with **Weights & Biases** as the experiment tracker *and* the data
 bus between stages.
 
-```
-  dataset-preprocess → cosmos-cap → vla-finetune → ┬─ base-eval ──────┐
-     (CPU, gpu:0)        (2 GPU)       (8 GPU)      └─ finetuned-eval ─┴─→ compare
-  tduggan93/forklift   Cosmos3-Nano  GR00T N1.6-3B    Isaac Sim          (verdict)
-  → GR00T LeRobot v2.1  captions      DDP finetune     base vs finetuned
-```
+<p align="center">
+  <img src="./assets/Osmo-DAG.png" alt="Weights & Biases" />
+</p>
+
+<p align="center">
+  <img src="./assets/W&B-linage-view.png" alt="Weights & Biases" />
+</p>
 
 It is organized as a **crawl → walk → run** progression so you can prove each
 piece cheaply before spending a full training node:
