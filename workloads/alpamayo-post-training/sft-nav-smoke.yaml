@@ -1,0 +1,148 @@
+version: 2
+# alpamayo1.5 SFT (navigation) — SMOKE on Osmo/CoreWeave, SINGLE GPU (target: B300, ~288GB).
+# Verifies the whole pipeline on a tiny subset: download Alpamayo-1.5-10B -> convert -> 3 nav chunks
+# -> Stage-1 (VLM) -> Stage-2 (trajectory diffusion expert), a few steps each, tracked in W&B.
+# Single GPU => no multi-GPU NCCL, so none of the RTX-6000 /dev/shm / NCCL / P2P workarounds are needed.
+# The 10B full finetune needs ~160GB; it fits natively on one B300 but OOMs on a 96GB RTX 6000
+# (on RTX 6000 this validates everything up to the optimizer allocation). Full run: sft-nav.yaml.
+default-values:
+  sft_max_steps: 20
+  sft_chunks: "214 224 276"   # 3 of the 19 nav chunks -> ~3 surviving samples (overfit smoke)
+workflow:
+  name: alpamayo-sft-nav-smoke
+  resources:
+    sft-gpu1:
+      platform: gpu
+      gpu: 1
+      cpu: 32
+      memory: 256Gi
+      storage: 1200Gi
+  groups:
+    - name: alpamayo-sft-nav-smoke-group
+      tasks:
+        - name: alpamayo-sft-nav-smoke
+          lead: true
+          resource: sft-gpu1
+          image: nvcr.io/nvidia/pytorch:25.05-py3
+          command: [bash]
+          args: [/scripts/run.sh]
+          credentials:
+            workflow-secrets:
+              HF_TOKEN: HF_TOKEN
+              WANDB_API_KEY: WANDB_API_KEY
+              WANDB_ENTITY: WANDB_ENTITY
+          files:
+            - path: /scripts/run.sh
+              contents: |
+                #!/usr/bin/env bash
+                set -euo pipefail
+                export DEBIAN_FRONTEND=noninteractive
+                echo "=== alpamayo1.5 SFT (nav) SMOKE — single GPU, max_steps={{ sft_max_steps }} chunks={{ sft_chunks }} ==="
+
+                # ---- system deps + uv ----
+                apt-get update -y >/dev/null 2>&1 || true
+                apt-get install -y --no-install-recommends git git-lfs curl ca-certificates unzip >/dev/null 2>&1 || true
+                curl -LsSf https://astral.sh/uv/install.sh | sh
+                export PATH="$HOME/.local/bin:$PATH"
+
+                export YOUR_HOME=/workspace
+                mkdir -p "$YOUR_HOME"; cd "$YOUR_HOME"
+                export HF_HUB_ENABLE_HF_TRANSFER=1
+                # Build flash-attn for THIS node's GPU (RTX 6000 -> 12.0, B300 -> its cc); SDPA fallback if it fails.
+                ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+                export TORCH_CUDA_ARCH_LIST="${ARCH:-12.0}"
+                echo "[env] building for compute capability: $TORCH_CUDA_ARCH_LIST"
+
+                # ---- clone recipe + build env (torch 2.8 cu128; flash-attn builds via nvcc) ----
+                git clone --depth 1 https://github.com/NVlabs/alpamayo-recipes.git
+                cd alpamayo-recipes/recipes/alpamayo1_5_sft
+                uv venv --python 3.12 a1_5_sft
+                source a1_5_sft/bin/activate
+                if ! uv sync --active; then
+                  echo "[warn] uv sync failed (likely flash-attn build) -> dropping flash-attn, using SDPA"
+                  sed -i '/flash-attn/d' pyproject.toml
+                  uv sync --active
+                fi
+                uv pip install hf_transfer
+                REPO="$YOUR_HOME/alpamayo-recipes"
+
+                # ---- base checkpoint: download + convert to A1 format ----
+                export MODEL_DIR="$YOUR_HOME/Alpamayo-1.5-10B"
+                export A1_DIR="$YOUR_HOME/Alpamayo-1.5-10B-A1-format"
+                MODEL_DIR="$MODEL_DIR" python - <<'PY'
+                import os
+                from huggingface_hub import snapshot_download
+                snapshot_download("nvidia/Alpamayo-1.5-10B", local_dir=os.environ["MODEL_DIR"],
+                                  token=os.environ.get("HF_TOKEN"), max_workers=8)
+                print("[model] Alpamayo-1.5-10B downloaded", flush=True)
+                PY
+                cd "$REPO"
+                python scripts/convert_checkpoint.py to-a1 --input "$MODEL_DIR" --output "$A1_DIR"
+
+                # ---- nav annotations (20-sample overfit demo); chunk subset keeps only those in our chunks ----
+                NAV_JSON="$YOUR_HOME/nav_demo_samples.json"
+                curl -fsSL https://raw.githubusercontent.com/NVlabs/alpamayo1.5/main/notebooks/nav_demo_samples.json -o "$NAV_JSON"
+
+                # ---- PAI data: only the smoke chunk subset (each holds >=1 nav clip). PAIDatasetWithNav
+                # iterates annotation samples and drops any whose clip isn't in the loaded chunks. ----
+                export PAI_DIR="$YOUR_HOME/pai_dataset"
+                export SFT_CHUNKS="{{ sft_chunks }}"
+                echo "[data] downloading PAI chunks: $SFT_CHUNKS"
+                python scripts/download_pai.py \
+                  --chunk-ids "$SFT_CHUNKS" \
+                  --camera camera_front_wide_120fov camera_cross_left_120fov camera_cross_right_120fov camera_front_tele_30fov \
+                  --calibration camera_intrinsics sensor_extrinsics \
+                  --labels egomotion \
+                  --output-dir "$PAI_DIR"
+                CHUNK_LIST="[$(echo "$SFT_CHUNKS" | tr ' ' ',')]"
+                echo "[data] dataset chunk_ids: $CHUNK_LIST"
+
+                # ---- W&B (HF Trainer report_to=wandb + Hydra wandb config) ----
+                export WANDB_PROJECT="${WANDB_PROJECT:-alpamayo-osmo}"
+                cd "$REPO/recipes/alpamayo1_5_sft"
+                sed -i 's|# - /wandb: default|- /wandb: default|' configs/sft_base.yaml
+                sed -i "s|team: ???|team: ${WANDB_ENTITY}|" configs/wandb/default.yaml
+                sed -i "s|project: ???|project: ${WANDB_PROJECT}|" configs/wandb/default.yaml
+
+                # ---- Stage 1: VLM SFT (single GPU, native; deepspeed disabled — no benefit on 1 rank) ----
+                export WANDB_NAME="alpamayo-sft-nav-smoke-stage1"
+                OUT1="$YOUR_HOME/output_stage1_nav"
+                torchrun --nproc_per_node 1 -m alpamayo1_5_sft.train_hf \
+                  --config-path pkg://alpamayo1_5_sft/configs \
+                  --config-name sft_stage1_nav \
+                  model.checkpoint_path="$A1_DIR" \
+                  data.train_dataset.local_dir="$PAI_DIR" \
+                  data.train_dataset.annotations_path="$NAV_JSON" \
+                  data.train_dataset.chunk_ids="$CHUNK_LIST" \
+                  data.val_dataset.local_dir="$PAI_DIR" \
+                  data.val_dataset.annotations_path="$NAV_JSON" \
+                  data.val_dataset.chunk_ids="$CHUNK_LIST" \
+                  trainer.deepspeed=null \
+                  trainer.dataloader_num_workers=0 \
+                  trainer.report_to=wandb \
+                  +trainer.max_steps={{ sft_max_steps }} \
+                  trainer.save_steps={{ sft_max_steps }} \
+                  paths.output_dir="$OUT1"
+                CKPT1=$(ls -d "$OUT1"/checkpoint-* | sort -V | tail -1)
+                echo "[stage1] checkpoint: $CKPT1"
+
+                # ---- Stage 2: trajectory diffusion expert (single GPU, native) ----
+                export WANDB_NAME="alpamayo-sft-nav-smoke-stage2"
+                OUT2="$YOUR_HOME/output_stage2_nav"
+                torchrun --nproc_per_node 1 -m alpamayo1_5_sft.train_hf \
+                  --config-path pkg://alpamayo1_5_sft/configs \
+                  --config-name sft_stage2_nav \
+                  model.pretrained_model_name_or_path="$A1_DIR" \
+                  model.stage1_vlm_checkpoint_path="$CKPT1" \
+                  data.train_dataset.local_dir="$PAI_DIR" \
+                  data.train_dataset.annotations_path="$NAV_JSON" \
+                  data.train_dataset.chunk_ids="$CHUNK_LIST" \
+                  data.val_dataset.local_dir="$PAI_DIR" \
+                  data.val_dataset.annotations_path="$NAV_JSON" \
+                  data.val_dataset.chunk_ids="$CHUNK_LIST" \
+                  trainer.dataloader_num_workers=0 \
+                  trainer.report_to=wandb \
+                  +trainer.max_steps={{ sft_max_steps }} \
+                  trainer.save_steps={{ sft_max_steps }} \
+                  paths.output_dir="$OUT2"
+                echo "=== alpamayo1.5 SFT (nav) SMOKE DONE — stage1+stage2 complete ==="

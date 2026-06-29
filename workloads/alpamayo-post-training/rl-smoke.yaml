@@ -1,0 +1,146 @@
+version: 2
+# alpamayo1.x RL (GRPO via Cosmos-RL) — SMOKE on Osmo/CoreWeave, 2 GPUs (target: B300).
+# Post-trains the RELEASED Alpamayo-1.5-10B. policy = 1 GPU (dp_shard_size=1, no FSDP shard) + rollout =
+# 1 GPU vLLM. A tiny PAI clip set + 1 epoch verifies the whole loop end-to-end, tracked in W&B.
+# Single-GPU-per-replica => no multi-GPU FSDP NCCL; on B300 the policy<->rollout sync uses NVLink P2P,
+# so none of the RTX-6000 /dev/shm / NCCL / P2P workarounds are needed. Full run: rl.yaml.
+# The 10B policy training needs ~160GB: fits natively on one B300; will OOM on a 96GB RTX 6000.
+default-values:
+  rl_epochs: 1
+  rl_n_generation: 4
+  rl_batch_per_replica: 8
+  rl_num_samples: 16
+workflow:
+  name: alpamayo-rl-smoke
+  resources:
+    rl-gpu2:
+      platform: gpu
+      gpu: 2
+      cpu: 48
+      memory: 512Gi
+      storage: 1200Gi
+  groups:
+    - name: alpamayo-rl-smoke-group
+      tasks:
+        - name: alpamayo-rl-smoke
+          lead: true
+          resource: rl-gpu2
+          image: nvcr.io/nvidia/pytorch:25.05-py3
+          command: [bash]
+          args: [/scripts/run.sh]
+          credentials:
+            workflow-secrets:
+              HF_TOKEN: HF_TOKEN
+              WANDB_API_KEY: WANDB_API_KEY
+              WANDB_ENTITY: WANDB_ENTITY
+          files:
+            - path: /scripts/run.sh
+              contents: |
+                #!/usr/bin/env bash
+                set -euo pipefail
+                export DEBIAN_FRONTEND=noninteractive
+                echo "=== alpamayo1.x RL (GRPO) SMOKE — 2 GPU, epochs={{ rl_epochs }} n_gen={{ rl_n_generation }} batch={{ rl_batch_per_replica }} samples={{ rl_num_samples }} ==="
+
+                # ---- system deps + uv (redis-server: cosmos-rl dispatcher backplane) ----
+                apt-get update -y >/dev/null 2>&1 || true
+                apt-get install -y --no-install-recommends git git-lfs curl ca-certificates redis-server >/dev/null 2>&1 || true
+                command -v redis-server >/dev/null || { echo "[fatal] redis-server not installed"; exit 1; }
+                curl -LsSf https://astral.sh/uv/install.sh | sh
+                export PATH="$HOME/.local/bin:$PATH"
+
+                export YOUR_HOME=/workspace
+                mkdir -p "$YOUR_HOME"; cd "$YOUR_HOME"
+                export HF_HUB_ENABLE_HF_TRANSFER=1
+                export PYTHONUNBUFFERED=1
+                export HF_HOME="$YOUR_HOME/.cache/huggingface"
+                ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+                export TORCH_CUDA_ARCH_LIST="${ARCH:-12.0}"
+                echo "[env] building for compute capability: $TORCH_CUDA_ARCH_LIST"
+
+                # ---- clone recipe + build env (cosmos-rl + vllm 0.11 + torch 2.8 cu128; flash-attn build-or-SDPA) ----
+                git clone --depth 1 https://github.com/NVlabs/alpamayo-recipes.git
+                cd alpamayo-recipes/recipes/alpamayo1_x_rl
+                uv venv --python 3.12 a1x_rl
+                source a1x_rl/bin/activate
+                uv sync --active --no-install-package flash-attn
+                if ! uv sync --active; then
+                  echo "[warn] flash-attn build failed -> continuing without it (SDPA)"
+                  sed -i '/flash-attn/d' pyproject.toml
+                  uv sync --active
+                fi
+                uv pip install hf_transfer
+                export ALPAMAYO_WORKSPACE="$YOUR_HOME/alpamayo-recipes"
+                cd "$ALPAMAYO_WORKSPACE"
+
+                # ---- convert released Alpamayo-1.5-10B -> RL training format (downloads Alpamayo + Cosmos-Reason2-8B) ----
+                export ALPAMAYO_MODEL_DIR="$YOUR_HOME/alpamayo_rl_model"
+                echo "[step] convert_release_config_to_training START $(date -u +%T)"
+                python -u scripts/convert_release_config_to_training.py \
+                  --alpamayo-model nvidia/Alpamayo-1.5-10B \
+                  --output-dir "$ALPAMAYO_MODEL_DIR"
+                echo "[step] convert DONE $(date -u +%T)"
+
+                # ---- PAI mini (chunk 3116) + curate clip index (entry expects clip_index_mini.parquet) ----
+                export ALPAMAYO_PAI_LOCAL_DIR="$YOUR_HOME/PAI_mini"
+                echo "[step] download_pai chunk 3116 START $(date -u +%T)"
+                python -u scripts/download_pai.py --chunk-ids 3116 \
+                  --camera camera_front_wide_120fov camera_cross_left_120fov camera_cross_right_120fov camera_front_tele_30fov \
+                  --calibration camera_intrinsics sensor_extrinsics vehicle_dimensions --labels egomotion \
+                  --output-dir "$ALPAMAYO_PAI_LOCAL_DIR"
+                echo "[step] curate_pai_samples ({{ rl_num_samples }}) START $(date -u +%T)"
+                python -u scripts/curate_pai_samples.py \
+                  --clip-index-path "$ALPAMAYO_PAI_LOCAL_DIR/clip_index.parquet" \
+                  --chunk 3116 --num-samples {{ rl_num_samples }} \
+                  --output-path "$ALPAMAYO_PAI_LOCAL_DIR/clip_index_mini.parquet"
+                echo "[step] data DONE $(date -u +%T)"
+
+                # ---- configure the local-test TOML: model path, output, single-GPU policy, smoke scale, W&B ----
+                export ALPAMAYO_LOG_DIR="$YOUR_HOME/rl_logs"; mkdir -p "$ALPAMAYO_LOG_DIR"
+                TOML="recipes/alpamayo1_x_rl/toml/alpamayo_rvla_rl_local_test.toml"
+                sed -i "s|/path/to/converted_alpamayo_model|${ALPAMAYO_MODEL_DIR}|" "$TOML"
+                sed -i "s|/path/to/alpamayo_cosmos_rl_job/outputs|${YOUR_HOME}/rl_outputs|" "$TOML"
+                sed -i "s|^epoch = .*|epoch = {{ rl_epochs }}|" "$TOML"
+                sed -i "s|^train_batch_per_replica = .*|train_batch_per_replica = {{ rl_batch_per_replica }}|" "$TOML"
+                sed -i "s|^n_generation = 12|n_generation = {{ rl_n_generation }}|" "$TOML"
+                sed -i "s|^dp_shard_size = 4|dp_shard_size = 1|" "$TOML"     # policy on a single GPU (10B fits on one B300)
+                sed -i "s|^capacity = 16|capacity = 0|" "$TOML"             # node-prefetch off: synchronous data path (no /dev/shm staging)
+                sed -i 's|project_name = "Alpamayo_RL"|project_name = "alpamayo-osmo"|' "$TOML"
+                sed -i 's|experiment_name = "ReasoningVLA_Post_Training"|experiment_name = "alpamayo-rl-smoke"|' "$TOML"
+
+                # ---- launch GRPO: policy (1 GPU) + rollout (1 GPU vLLM). cosmos-rl writes per-replica .log
+                # files (not stdout) and HANGS if a replica dies, so stream the logs live + watchdog-kill. ----
+                export HYDRA_FULL_ERROR=1 COSMOS_LOG_LEVEL=INFO
+                echo "[step] launching cosmos-rl GRPO START $(date -u +%T)"
+                CRL_OUT="$YOUR_HOME/cosmos_rl_stdout.log"
+                set +e
+                stdbuf -oL -eL cosmos-rl --config "$TOML" --policy 1 --rollout 1 --log-dir "$ALPAMAYO_LOG_DIR" \
+                  recipes/alpamayo1_x_rl/models/reasoning_vla/alpamayo_cosmos_rl_post_training_entry.py \
+                  > "$CRL_OUT" 2>&1 &
+                CRL_PID=$!
+                ( tail -n +1 -F "$CRL_OUT" 2>/dev/null & \
+                  while kill -0 "$CRL_PID" 2>/dev/null; do
+                    for f in $(find "$ALPAMAYO_LOG_DIR" -name '*.log' 2>/dev/null); do
+                      case "$STREAMED" in *"|$f|"*) ;; *) STREAMED="${STREAMED}|$f|"; tail -n +1 -F "$f" 2>/dev/null & ;; esac
+                    done
+                    sleep 5
+                  done ) &
+                STREAM_PID=$!
+                ( while kill -0 "$CRL_PID" 2>/dev/null; do
+                    if grep -qE "failed with return code|Process .* exited with code [1-9]" "$CRL_OUT" 2>/dev/null; then
+                      echo "[watchdog] replica failure detected -> terminating cosmos-rl"
+                      kill "$CRL_PID" 2>/dev/null; sleep 8; kill -9 "$CRL_PID" 2>/dev/null; break
+                    fi
+                    sleep 10
+                  done ) &
+                WD_PID=$!
+                wait "$CRL_PID"; RC=$?
+                kill "$STREAM_PID" "$WD_PID" 2>/dev/null || true
+                set -e
+                sleep 3
+                echo "=== cosmos-rl per-replica logs (controller / policy / rollout) ==="
+                for f in $(find "$ALPAMAYO_LOG_DIR" -name '*.log' 2>/dev/null | sort); do
+                  echo "----------------------------- $f -----------------------------"
+                  tail -150 "$f" 2>/dev/null || true
+                done
+                [ "$RC" -eq 0 ] || { echo "cosmos-rl exited $RC"; exit "$RC"; }
+                echo "=== alpamayo1.x RL (GRPO) SMOKE DONE ==="
