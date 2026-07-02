@@ -1,29 +1,31 @@
 version: 2
-# alpamayo1.5 SFT (navigation) — FULL run on Osmo/CoreWeave, SINGLE GPU (target: B300, ~288GB).
-# Full nav training: all 19 nav chunks (20 samples), Stage-1 (VLM) -> Stage-2 (trajectory diffusion
-# expert) at the recipe's full epoch schedule. Tracked in W&B. Verify mechanics first with sft-nav-smoke.
-# Single GPU => no multi-GPU NCCL, so none of the RTX-6000 /dev/shm / NCCL / P2P workarounds are needed.
-# The 10B full finetune needs ~160GB: fits natively on one B300; will OOM on a 96GB RTX 6000.
+# alpamayo1.5 SFT (navigation) — FULL run on Osmo/CoreWeave B300 (b300-8x node), faithful to the upstream
+# recipe (NVlabs/alpamayo-recipes alpamayo1_5_sft): native 8-GPU torchrun + DeepSpeed ZeRO-2, Stage-1
+# (VLM) -> Stage-2 (trajectory diffusion expert), all 19 nav chunks at the recipe's full epoch schedule,
+# tracked in W&B (project alpamayo-osmo). Verify mechanics first with sft-nav-smoke.yaml.
+#
+# Only B300-specific alteration vs the recipe: reinstall the recipe's torch==2.8.0 built against CUDA 12.9
+# (torch==2.8.0+cu129) so nvrtc can target B300's compute capability sm_103 (cu128 tops out at sm_100/sm_120).
 # Scale knobs: --set sft_epochs=<n> sft_chunks="<ids>".
 default-values:
-  sft_epochs: 700                 # recipe's full nav schedule (overfit-to-convergence on the 20 samples)
+  sft_epochs: 700                 # recipe's full nav schedule
   sft_save_steps: 500
   sft_chunks: "214 224 276 317 420 727 728 968 982 1519 1657 1984 2277 2368 2372 2447 2599 2634 2868"
 workflow:
   name: alpamayo-sft-nav
   resources:
-    sft-gpu1:
+    sft-gpu8:
       platform: gpu
-      gpu: 1
-      cpu: 32
-      memory: 256Gi
-      storage: 1200Gi
+      gpu: 8
+      cpu: 128
+      memory: 1024Gi
+      storage: 2000Gi
   groups:
     - name: alpamayo-sft-nav-group
       tasks:
         - name: alpamayo-sft-nav
           lead: true
-          resource: sft-gpu1
+          resource: sft-gpu8
           image: nvcr.io/nvidia/pytorch:25.05-py3
           command: [bash]
           args: [/scripts/run.sh]
@@ -38,7 +40,7 @@ workflow:
                 #!/usr/bin/env bash
                 set -euo pipefail
                 export DEBIAN_FRONTEND=noninteractive
-                echo "=== alpamayo1.5 SFT (nav) FULL — single GPU, epochs={{ sft_epochs }} chunks={{ sft_chunks }} ==="
+                echo "=== alpamayo1.5 SFT (nav) FULL — B300 8-GPU, epochs={{ sft_epochs }} chunks={{ sft_chunks }} ==="
 
                 # ---- system deps + uv ----
                 apt-get update -y >/dev/null 2>&1 || true
@@ -49,22 +51,22 @@ workflow:
                 export YOUR_HOME=/workspace
                 mkdir -p "$YOUR_HOME"; cd "$YOUR_HOME"
                 export HF_HUB_ENABLE_HF_TRANSFER=1
-                # Build flash-attn for THIS node's GPU (RTX 6000 -> 12.0, B300 -> its cc); SDPA fallback if it fails.
                 ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
-                export TORCH_CUDA_ARCH_LIST="${ARCH:-12.0}"
-                echo "[env] building for compute capability: $TORCH_CUDA_ARCH_LIST"
+                export TORCH_CUDA_ARCH_LIST="${ARCH:-10.0}"
+                echo "[env] GPU compute capability: $TORCH_CUDA_ARCH_LIST"
 
-                # ---- clone recipe + build env (torch 2.8 cu128; flash-attn builds via nvcc) ----
+                # ---- clone recipe + build env (recipe pins torch 2.8.0; we then swap to the cu129 build for B300) ----
                 git clone --depth 1 https://github.com/NVlabs/alpamayo-recipes.git
                 cd alpamayo-recipes/recipes/alpamayo1_5_sft
                 uv venv --python 3.12 a1_5_sft
                 source a1_5_sft/bin/activate
-                if ! uv sync --active; then
-                  echo "[warn] uv sync failed (likely flash-attn build) -> dropping flash-attn, using SDPA"
-                  sed -i '/flash-attn/d' pyproject.toml
-                  uv sync --active
-                fi
+                uv sync --active --no-install-package flash-attn       # recipe deps (torch 2.8.0 cu128) minus flash-attn
+                # B300 (sm_103) fix: same torch version, CUDA 12.9 build -> nvrtc that supports sm_103
+                uv pip install --reinstall torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
+                # build flash-attn against the cu129 torch (NOT `uv sync`, which would revert torch to the cu128 pin)
+                uv pip install flash-attn==2.8.3 --no-build-isolation || echo "[warn] flash-attn build failed -> SDPA fallback"
                 uv pip install hf_transfer
+                python -c "import torch;print('[env] torch',torch.__version__,'cuda',torch.version.cuda)"
                 REPO="$YOUR_HOME/alpamayo-recipes"
 
                 # ---- base checkpoint: download + convert to A1 format ----
@@ -84,7 +86,7 @@ workflow:
                 NAV_JSON="$YOUR_HOME/nav_demo_samples.json"
                 curl -fsSL https://raw.githubusercontent.com/NVlabs/alpamayo1.5/main/notebooks/nav_demo_samples.json -o "$NAV_JSON"
 
-                # ---- PAI data: all 19 nav chunks (full dataset for these annotations) ----
+                # ---- PAI data: all 19 nav chunks ----
                 export PAI_DIR="$YOUR_HOME/pai_dataset"
                 export SFT_CHUNKS="{{ sft_chunks }}"
                 echo "[data] downloading PAI chunks: $SFT_CHUNKS"
@@ -97,17 +99,46 @@ workflow:
                 CHUNK_LIST="[$(echo "$SFT_CHUNKS" | tr ' ' ',')]"
                 echo "[data] dataset chunk_ids: $CHUNK_LIST"
 
-                # ---- W&B (HF Trainer report_to=wandb + Hydra wandb config) ----
+                # ---- W&B (recipe: uncomment wandb default, fill team/project, set report_to=wandb) ----
                 export WANDB_PROJECT="${WANDB_PROJECT:-alpamayo-osmo}"
+                # NOTE: do NOT set WANDB_LOG_MODEL — transformers 4.57.1's WandbCallback.on_train_end does an
+                # extra save_model() that, under DeepSpeed, calls accelerate.get_state_dict() -> the removed
+                # Accelerator.deepspeed_config attr ("'Accelerator' object has no attribute 'deepspeed_config'"),
+                # which crashes the job AFTER training completes. We log each finetuned model EXPLICITLY below
+                # (post-torchrun, non-fatal), consistent with how the RL recipe logs its policy artifact.
                 cd "$REPO/recipes/alpamayo1_5_sft"
                 sed -i 's|# - /wandb: default|- /wandb: default|' configs/sft_base.yaml
                 sed -i "s|team: ???|team: ${WANDB_ENTITY}|" configs/wandb/default.yaml
                 sed -i "s|project: ???|project: ${WANDB_PROJECT}|" configs/wandb/default.yaml
+                DS_CFG="$(pwd)/configs/deepspeed/zero2.json"
 
-                # ---- Stage 1: VLM SFT (single GPU, native; full epoch schedule) ----
+                # log a finetuned checkpoint as a W&B model artifact (model weights only — skip the DeepSpeed
+                # optimizer shards in global_step*/ and the optimizer/scheduler/rng state). Non-fatal: a W&B
+                # hiccup must never fail an otherwise-good multi-hour run.
+                log_model_artifact() {
+                CKPT="$1" ARTNAME="$2" python - <<'PY' || echo "[wandb] artifact log failed (non-fatal)"
+                import os, wandb
+                ckpt = os.environ["CKPT"]; name = os.environ["ARTNAME"]
+                if not (os.path.isdir(ckpt) and os.listdir(ckpt)):
+                    print("[wandb] no checkpoint to log:", ckpt); raise SystemExit(0)
+                run = wandb.init(project=os.environ.get("WANDB_PROJECT","alpamayo-osmo"),
+                                 entity=os.environ.get("WANDB_ENTITY"), name=name, job_type="model")
+                art = wandb.Artifact(name, type="model"); n = 0
+                for root, _, files in os.walk(ckpt):
+                    if "global_step" in root: continue
+                    for fn in files:
+                        if fn.startswith(("optimizer", "scheduler", "rng_state")): continue
+                        p = os.path.join(root, fn); art.add_file(p, name=os.path.relpath(p, ckpt)); n += 1
+                print(f"[wandb] adding {n} model files from {ckpt}", flush=True)
+                run.log_artifact(art); run.finish()
+                print("[wandb] artifact logged:", name)
+                PY
+                }
+
+                # ---- Stage 1: VLM SFT — recipe launch (8-GPU torchrun + DeepSpeed ZeRO-2), full epoch schedule ----
                 export WANDB_NAME="alpamayo-sft-nav-stage1"
                 OUT1="$YOUR_HOME/output_stage1_nav"
-                torchrun --nproc_per_node 1 -m alpamayo1_5_sft.train_hf \
+                torchrun --nproc_per_node 8 -m alpamayo1_5_sft.train_hf \
                   --config-path pkg://alpamayo1_5_sft/configs \
                   --config-name sft_stage1_nav \
                   model.checkpoint_path="$A1_DIR" \
@@ -117,7 +148,7 @@ workflow:
                   data.val_dataset.local_dir="$PAI_DIR" \
                   data.val_dataset.annotations_path="$NAV_JSON" \
                   data.val_dataset.chunk_ids="$CHUNK_LIST" \
-                  trainer.deepspeed=null \
+                  trainer.deepspeed="$DS_CFG" \
                   trainer.dataloader_num_workers=0 \
                   trainer.report_to=wandb \
                   trainer.num_train_epochs={{ sft_epochs }} \
@@ -125,11 +156,12 @@ workflow:
                   paths.output_dir="$OUT1"
                 CKPT1=$(ls -d "$OUT1"/checkpoint-* | sort -V | tail -1)
                 echo "[stage1] checkpoint: $CKPT1"
+                log_model_artifact "$CKPT1" "alpamayo-sft-nav-stage1"
 
-                # ---- Stage 2: trajectory diffusion expert (single GPU, native; full epoch schedule) ----
+                # ---- Stage 2: trajectory diffusion expert — recipe launch, full epoch schedule ----
                 export WANDB_NAME="alpamayo-sft-nav-stage2"
                 OUT2="$YOUR_HOME/output_stage2_nav"
-                torchrun --nproc_per_node 1 -m alpamayo1_5_sft.train_hf \
+                torchrun --nproc_per_node 8 -m alpamayo1_5_sft.train_hf \
                   --config-path pkg://alpamayo1_5_sft/configs \
                   --config-name sft_stage2_nav \
                   model.pretrained_model_name_or_path="$A1_DIR" \
@@ -145,4 +177,7 @@ workflow:
                   trainer.num_train_epochs={{ sft_epochs }} \
                   trainer.save_steps={{ sft_save_steps }} \
                   paths.output_dir="$OUT2"
+                CKPT2=$(ls -d "$OUT2"/checkpoint-* | sort -V | tail -1)
+                echo "[stage2] checkpoint: $CKPT2"
+                log_model_artifact "$CKPT2" "alpamayo-sft-nav-stage2"
                 echo "=== alpamayo1.5 SFT (nav) FULL DONE — stage1+stage2 complete ==="
