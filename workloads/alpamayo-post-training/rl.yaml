@@ -19,7 +19,10 @@ workflow:
       gpu: 2
       cpu: 48
       memory: 512Gi
-      storage: 1200Gi
+      # cosmos-rl writes a full 10B policy+optimizer checkpoint (~150-180GB) every save_freq steps; at the
+      # recipe default max_keep=10 these accumulated past 1200Gi and the pod was evicted mid-run. Give ample
+      # headroom (node has 27180Gi) and also cap retention to 3 in the TOML below.
+      storage: 4000Gi
   groups:
     - name: alpamayo-rl-group
       tasks:
@@ -121,6 +124,9 @@ workflow:
                 sed -i "s|^capacity = 16|capacity = 0|" "$TOML"             # node-prefetch off: synchronous data path (no /dev/shm staging)
                 sed -i 's|project_name = "Alpamayo_RL"|project_name = "alpamayo-osmo"|' "$TOML"
                 sed -i 's|experiment_name = "ReasoningVLA_Post_Training"|experiment_name = "alpamayo-rl"|' "$TOML"
+                # cap retained checkpoints: each 10B policy+optimizer ckpt is ~150-180GB; the recipe default
+                # max_keep=10 accumulated >1.2TB and evicted the pod. Keep the last 3 (final + 2 for recovery).
+                sed -i "s|^max_keep = .*|max_keep = 3|" "$TOML"
 
                 # ---- launch GRPO: policy (1 GPU) + rollout (1 GPU vLLM). cosmos-rl writes per-replica .log
                 # files (not stdout) and HANGS if a replica dies, so stream the logs live + watchdog-kill. ----
@@ -168,17 +174,36 @@ workflow:
                 done
                 [ "$RC" -eq 0 ] || { echo "cosmos-rl exited $RC"; exit "$RC"; }
 
-                # ---- log the trained policy checkpoint as a W&B model artifact (cosmos-rl is not HF Trainer,
-                # so WANDB_LOG_MODEL does not apply -> log it explicitly) ----
+                # ---- log ONLY the final policy checkpoint's model weights as a W&B artifact (cosmos-rl is not
+                # HF Trainer, so WANDB_LOG_MODEL does not apply). Logging all of rl_outputs would upload every
+                # retained checkpoint + optimizer state (hundreds of GB) -> pick the latest step_*/policy and
+                # keep just the weight/config files. ----
                 export WANDB_PROJECT="${WANDB_PROJECT:-alpamayo-osmo}"
                 python - <<'PY'
-                import os, wandb
-                out = os.path.join(os.environ["YOUR_HOME"], "rl_outputs")
-                run = wandb.init(project=os.environ.get("WANDB_PROJECT","alpamayo-osmo"), entity=os.environ.get("WANDB_ENTITY"), name="alpamayo-rl-policy", job_type="model")
+                import os, glob, re, wandb
+                base = os.path.join(os.environ["YOUR_HOME"], "rl_outputs")
+                cks = glob.glob(os.path.join(base, "*", "checkpoints", "step_*", "policy"))
+                if not cks: cks = glob.glob(os.path.join(base, "**", "step_*"), recursive=True)
+                def step_of(p):
+                    m = re.search(r"step_(\d+)", p); return int(m.group(1)) if m else -1
+                cks = sorted(set(cks), key=step_of)
+                if not cks:
+                    print("[wandb] no RL policy checkpoint found under", base); raise SystemExit(0)
+                final = cks[-1]
+                run = wandb.init(project=os.environ.get("WANDB_PROJECT","alpamayo-osmo"),
+                                 entity=os.environ.get("WANDB_ENTITY"), name="alpamayo-rl-policy", job_type="model")
                 art = wandb.Artifact("alpamayo-rl-policy", type="model")
-                art.add_dir(out) if os.path.isdir(out) and os.listdir(out) else print("[wandb] no rl_outputs to log:", out)
-                run.log_artifact(art)
-                run.finish()
-                print("[wandb] RL policy artifact logged from", out)
+                KEEP = (".safetensors", ".json", ".txt", ".model", ".vocab", ".yaml", ".yml")
+                n = 0
+                for root, _, files in os.walk(final):
+                    for fn in files:
+                        low = fn.lower()
+                        if low.endswith(KEEP) or "config" in low or "token" in low:
+                            p = os.path.join(root, fn); art.add_file(p, name=os.path.relpath(p, final)); n += 1
+                if n == 0:                                   # unknown layout -> fall back to the whole final ckpt
+                    art.add_dir(final); print("[wandb] no weight files matched; logging full", final)
+                print(f"[wandb] logging {n} weight files from {final}", flush=True)
+                run.log_artifact(art); run.finish()
+                print("[wandb] RL policy artifact logged from", final)
                 PY
                 echo "=== alpamayo1.x RL (GRPO) FULL DONE ==="
