@@ -193,16 +193,16 @@ workflow:
                 run = wandb.init(project=os.environ.get("WANDB_PROJECT","alpamayo-osmo"),
                                  entity=os.environ.get("WANDB_ENTITY"), name="alpamayo-rl-policy", job_type="model")
                 art = wandb.Artifact("alpamayo-rl-policy", type="model")
-                KEEP = (".safetensors", ".json", ".txt", ".model", ".vocab", ".yaml", ".yml")
+                # cosmos-rl saves the policy as model_rank_*.pth (~20GB) alongside optimizer_rank_*.pth (~40GB),
+                # cosmos_config, and small extra_info/scheduler .pth. Keep the model + config + small metadata;
+                # skip ONLY the big optimizer state and the .rank_*_complete markers.
                 n = 0
                 for root, _, files in os.walk(final):
                     for fn in files:
-                        low = fn.lower()
-                        if low.endswith(KEEP) or "config" in low or "token" in low:
-                            p = os.path.join(root, fn); art.add_file(p, name=os.path.relpath(p, final)); n += 1
-                if n == 0:                                   # unknown layout -> fall back to the whole final ckpt
-                    art.add_dir(final); print("[wandb] no weight files matched; logging full", final)
-                print(f"[wandb] logging {n} weight files from {final}", flush=True)
+                        if fn.startswith("optimizer") or fn.startswith(".rank"):
+                            continue
+                        p = os.path.join(root, fn); art.add_file(p, name=os.path.relpath(p, final)); n += 1
+                print(f"[wandb] logging {n} policy files (model+config, optimizer skipped) from {final}", flush=True)
                 run.log_artifact(art); run.finish()
                 print("[wandb] RL policy artifact logged from", final)
                 PY
