@@ -43,6 +43,10 @@ workflow:
                 #!/usr/bin/env bash
                 set -euo pipefail
                 export DEBIAN_FRONTEND=noninteractive
+                # cosmos-rl spawns a redis daemon and we background `tail -F` log-streamers; if these outlive the
+                # script the osmo task never exits (pod lingers RUNNING, holding the node) even after FULL DONE.
+                # Reap them on every exit path so the task self-terminates cleanly.
+                trap 'pkill -f "tail -n +1 -F" 2>/dev/null; pkill -x redis-server 2>/dev/null; true' EXIT
                 echo "=== alpamayo1.x RL (GRPO) FULL — 2 GPU, epochs={{ rl_epochs }} n_gen={{ rl_n_generation }} batch={{ rl_batch_per_replica }} samples={{ rl_num_samples }} ==="
 
                 # ---- system deps + uv (redis-server: cosmos-rl dispatcher backplane) ----
