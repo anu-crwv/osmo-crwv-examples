@@ -42,6 +42,27 @@ is assembled from them (the eval task is transformed into the two single-policy
 tasks via an `EVAL_MODEL` env switch). **Change a stage in `workloads/stage-level-smoke-test/`, prove it,
 then refold it into `workloads/full-pipeline/full-pipeline.yaml`.**
 
+### Two data-handoff builds of the pipeline — keep in sync
+
+`workloads/full-pipeline/` has **two builds of the same DAG**, differing *only* in
+how data crosses stages:
+
+- **`full-pipeline.yaml`** (default) — data hands off via **W&B `:latest`
+  artifacts** (producer `log_artifact`; consumer `api.artifact(...).download()`).
+- **`full-pipeline-osmo-native.yaml`** — data hands off via **Osmo object storage
+  (CAIOS)**: producer writes `{{output}}`, consumer reads `{{input:N}}`; the `client`
+  sidecar stages the payload under
+  `s3://<workflows-bucket>/osmo_workflow_data/<wf-id>/<task>/`. **W&B is
+  tracking-only** — no `wandb.Artifact` / `use_artifact` / `.download()`. Validated
+  end-to-end (`av-pipeline-osmo-1`: all stages COMPLETED; dataset → captioned dataset
+  → 21 GB checkpoint → eval summaries all moved through object storage).
+
+When you change a stage's **logic**, mirror it into **both** pipeline files — they
+diverge only on the handoff lines. In the osmo-native build those are
+`export IN_DIR="{{input:0}}/dataset"` / `DATASET_ROOT="{{input:0}}/dataset"` /
+`FT_CKPT_DIR="{{input:0}}/checkpoint-final"` (each guarded by `test -f … || fatal`),
+producers write to `{{output}}`, and there is **no** artifact logging/download.
+
 ---
 
 ## Operating rules (non-negotiable)
@@ -125,10 +146,17 @@ edit the default). When in doubt, `--dry-run` and grep the rendered YAML.
 - **`env:` is NOT a valid task field.** Set env with `export FOO=bar` in the
   script, or `--set-env`/`--set` at submit.
 - **Stage ordering vs data handoff are separate.** `inputs: [{task: <producer>}]`
-  sequences; data moves via **W&B artifacts**. `{{output}}`/`{{input:N}}` is the
-  *file* handoff (used here only by `compare` to read the two eval summaries).
-- **Do NOT use `osmo data upload/download` inside a task** — `NoCredentialsError`
-  (the bucket default credential doesn't inject into tasks). Use W&B artifacts.
+  sequences the stages; the *data* moves either via **W&B artifacts**
+  (`full-pipeline.yaml`) or via **Osmo object storage** (`full-pipeline-osmo-native.yaml`).
+- **`{{output}}` / `{{input:N}}`** (→ `/osmo/data/output`, `/osmo/data/input/N`) is
+  Osmo's native, sidecar-managed object-storage handoff (CAIOS) — it **works**
+  end-to-end (`full-pipeline-osmo-native.yaml` uses it for every stage; `full-pipeline.yaml`
+  uses it only for `compare` reading the two eval summaries).
+- **Do NOT use the `osmo data upload/download` CLI inside a task** — `NoCredentialsError`
+  (the bucket's default credential doesn't inject into tasks). This is a **different**
+  mechanism from `{{output}}`/`{{input:N}}`, which is fine (the sidecar handles that
+  with the workflow's own credential). Pass data with W&B artifacts **or**
+  `{{output}}`/`{{input:N}}`; never the `osmo data` CLI.
 - The CLI has **no `-f`/follow** on `logs`. Poll `osmo workflow query <id>` and
   `osmo workflow logs <id> -n 200` (add `--task <name>` / `--error`).
 
@@ -246,4 +274,5 @@ drive or fork-height, and do not auto-attach the pallet from anywhere.
 | captioning logic | `workloads/stage-level-smoke-test/cosmos-cap.yaml` |
 | finetune logic | `workloads/stage-level-smoke-test/finetune.yaml` |
 | eval logic | `workloads/stage-level-smoke-test/eval.yaml` |
-| chained e2e (parallel eval) | `workloads/full-pipeline/full-pipeline.yaml` (assembled from the four above) |
+| chained e2e (parallel eval) | `workloads/full-pipeline/full-pipeline.yaml` (assembled from the four above; W&B-artifact handoff) |
+| chained e2e, Osmo object-storage handoff | `workloads/full-pipeline/full-pipeline-osmo-native.yaml` (same DAG; `{{output}}`/`{{input:N}}` instead of W&B artifacts) |

@@ -79,6 +79,19 @@ following the artifact edges gives you full provenance: any eval traces back to
 the exact captioned episodes the policy trained on. The `inputs:` edges in the
 YAML only enforce *ordering* — the **data** moves through W&B.
 
+> **Alternative — Osmo-native data passing (no W&B in the data path).**
+> [`workloads/full-pipeline/full-pipeline-osmo-native.yaml`](workloads/full-pipeline/full-pipeline-osmo-native.yaml)
+> is the **same DAG**, but hands data between stages over **Osmo's object storage
+> (CoreWeave AI Object Storage / CAIOS)** instead of W&B artifacts: each producer
+> writes to `{{output}}` and each consumer reads `{{input:N}}` — Osmo's `client`
+> sidecar uploads on task-complete / downloads on task-start under
+> `s3://<workflows-bucket>/osmo_workflow_data/<wf-id>/<task>/`. **W&B stays for
+> experiment tracking only** (metrics, tables, videos, summaries); no dataset/model
+> blobs round-trip through it. Validated end-to-end — all stages COMPLETED and every
+> handoff (dataset → captioned dataset → 21 GB checkpoint → eval summaries) moved
+> through object storage. Trade-off: the W&B artifact *lineage graph* isn't built
+> (data lineage lives in Osmo instead). See the [walk/run](#-walk--run--the-full-pipeline) section.
+
 ---
 
 ## The pipeline stages
@@ -178,6 +191,16 @@ osmo workflow submit workloads/full-pipeline/full-pipeline.yaml --pool default \
 osmo workflow submit workloads/full-pipeline/full-pipeline.yaml --pool default
 ```
 
+**Data-handoff variant** — [`full-pipeline-osmo-native.yaml`](workloads/full-pipeline/full-pipeline-osmo-native.yaml)
+is the same DAG and the same `--set` knobs, but passes data between stages via
+**Osmo object storage** (`{{output}}`/`{{input:N}}`) instead of W&B artifacts; W&B
+is tracking-only. Submit it exactly the same way:
+
+```bash
+osmo workflow submit workloads/full-pipeline/full-pipeline-osmo-native.yaml --pool default \
+  --set max_steps=100 n_episodes=3
+```
+
 > **Why `--set`, not `--set-env`?** In a *multi-task* pipeline, `--set-env`
 > reaches only the lead task — it will **not** change `MAX_STEPS` on the finetune
 > task. `--set` does submit-time templating of `{{ field }}` and is reliable
@@ -237,10 +260,13 @@ osmo-crwv-examples/
     │   ├── finetune.yaml                     (50 steps)
     │   └── eval.yaml                         (1 episode)
     └── full-pipeline/
-        └── full-pipeline.yaml                ← 🚶 walk (--set small) / 🏃 run (defaults)
+        ├── full-pipeline.yaml                ← 🚶 walk (--set small) / 🏃 run (defaults) — data hands off via W&B artifacts
+        └── full-pipeline-osmo-native.yaml    ← same DAG, data hands off via Osmo object storage ({{output}}/{{input:N}}); W&B = tracking only
 ```
 
 The `workloads/stage-level-smoke-test/` files are the **source of truth per stage**; `workloads/full-pipeline/full-pipeline.yaml`
 is assembled from them (with the eval fanned out into parallel base/finetuned
 tasks + a compare). Change a stage in `workloads/stage-level-smoke-test/`, prove it, then refold it into the
-pipeline.
+pipeline. `full-pipeline-osmo-native.yaml` is the same DAG with the W&B-artifact
+data handoffs swapped for Osmo object-storage (`{{output}}`/`{{input:N}}`) reads —
+keep the two pipeline files in sync when you change a stage's logic.
