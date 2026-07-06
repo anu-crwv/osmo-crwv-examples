@@ -39,6 +39,10 @@ workflow:
                 #!/usr/bin/env bash
                 set -euo pipefail
                 export DEBIAN_FRONTEND=noninteractive
+                # cosmos-rl spawns a redis daemon and we background `tail -F` log-streamers; if these outlive the
+                # script the osmo task never exits (pod lingers RUNNING, holding the node) even after SMOKE DONE.
+                # Reap them on every exit path so the task self-terminates cleanly.
+                trap 'pkill -f "tail -n +1 -F" 2>/dev/null; pkill -x redis-server 2>/dev/null; true' EXIT
                 echo "=== alpamayo1.x RL (GRPO) SMOKE — 2 GPU, epochs={{ rl_epochs }} n_gen={{ rl_n_generation }} batch={{ rl_batch_per_replica }} samples={{ rl_num_samples }} ==="
 
                 # ---- system deps + uv (redis-server: cosmos-rl dispatcher backplane) ----
@@ -62,13 +66,27 @@ workflow:
                 cd alpamayo-recipes/recipes/alpamayo1_x_rl
                 uv venv --python 3.12 a1x_rl
                 source a1x_rl/bin/activate
-                uv sync --active --no-install-package flash-attn
-                if ! uv sync --active; then
-                  echo "[warn] flash-attn build failed -> continuing without it (SDPA)"
-                  sed -i '/flash-attn/d' pyproject.toml
-                  uv sync --active
-                fi
+                uv sync --active --no-install-package flash-attn       # torch 2.8.0 cu128 + vllm 0.11 + cosmos-rl, minus flash-attn
+                # B300 (sm_103) fix: same torch version, CUDA 12.9 build -> nvrtc + triton/ptxas that support sm_103
+                # (the cu128 stack fails with "ptxas fatal: Value 'sm_103a' is not defined").
+                uv pip install --reinstall torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
+                # build flash-attn against the cu129 torch (NOT `uv sync`, which would revert torch to the cu128 pin)
+                uv pip install flash-attn==2.8.3 --no-build-isolation || echo "[warn] flash-attn build failed -> SDPA fallback"
                 uv pip install hf_transfer
+                # vLLM 0.11's rollout engine imports numba, which requires NumPy <= 2.2; the resolved env pulls
+                # NumPy 2.4 ("ImportError: Numba needs NumPy 2.2 or less"), crashing the rollout worker -> pin down.
+                uv pip install "numpy<2.3"
+                python -c "import numpy,torch;print('[env] numpy',numpy.__version__,'torch',torch.__version__,'cuda',torch.version.cuda)"
+                # Triton (bundled with torch 2.8) ships its OWN CUDA 12.8 ptxas, which lacks sm_103a and breaks the
+                # vLLM rollout's Triton JIT ("ptxas fatal: Value 'sm_103a' is not defined"). The cu129 torch swap
+                # only fixes torch's own nvrtc, NOT Triton's bundled ptxas -> install a CUDA 12.9 ptxas and point
+                # Triton at it via TRITON_PTXAS_PATH (a 12.9 ptxas compiles Triton's PTX for sm_103a fine).
+                uv pip install "nvidia-cuda-nvcc-cu12>=12.9,<13"
+                TRITON_PTXAS_PATH="$(find "${VIRTUAL_ENV:-.}" -path '*/nvidia/cuda_nvcc/bin/ptxas' 2>/dev/null | head -1)"
+                if [ -z "$TRITON_PTXAS_PATH" ] && [ -x /usr/local/cuda/bin/ptxas ]; then TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas; fi
+                export TRITON_PTXAS_PATH
+                echo "[env] TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-<unset>}"
+                [ -n "${TRITON_PTXAS_PATH:-}" ] && "$TRITON_PTXAS_PATH" --version 2>/dev/null | tail -1 || true
                 export ALPAMAYO_WORKSPACE="$YOUR_HOME/alpamayo-recipes"
                 cd "$ALPAMAYO_WORKSPACE"
 
@@ -110,6 +128,14 @@ workflow:
                 # ---- launch GRPO: policy (1 GPU) + rollout (1 GPU vLLM). cosmos-rl writes per-replica .log
                 # files (not stdout) and HANGS if a replica dies, so stream the logs live + watchdog-kill. ----
                 export HYDRA_FULL_ERROR=1 COSMOS_LOG_LEVEL=INFO
+                # The policy<->rollout weight-sync NCCL comm (POLICY_TO_ROLLOUT_UNICAST) failed at create_nccl_comm
+                # with ncclSystemError (err=2): NCCL's cross-process SHM transport starves on osmo's ~64MB /dev/shm.
+                # B300 GPUs are P2P/NVLink-capable, so disable SHM (forces P2P/NVLink for the same-node comm) and
+                # enable cuMem so cross-process P2P buffer registration works. NCCL_DEBUG surfaces the transport.
+                export NCCL_SHM_DISABLE=1
+                export NCCL_CUMEM_ENABLE=1
+                export NCCL_DEBUG=INFO
+                export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,ENV
                 echo "[step] launching cosmos-rl GRPO START $(date -u +%T)"
                 CRL_OUT="$YOUR_HOME/cosmos_rl_stdout.log"
                 set +e
@@ -117,7 +143,8 @@ workflow:
                   recipes/alpamayo1_x_rl/models/reasoning_vla/alpamayo_cosmos_rl_post_training_entry.py \
                   > "$CRL_OUT" 2>&1 &
                 CRL_PID=$!
-                ( tail -n +1 -F "$CRL_OUT" 2>/dev/null & \
+                ( STREAMED=""                                    # init: under `set -u` an unset $STREAMED kills this
+                  tail -n +1 -F "$CRL_OUT" 2>/dev/null & \       # streamer, so per-replica logs never reach stdout
                   while kill -0 "$CRL_PID" 2>/dev/null; do
                     for f in $(find "$ALPAMAYO_LOG_DIR" -name '*.log' 2>/dev/null); do
                       case "$STREAMED" in *"|$f|"*) ;; *) STREAMED="${STREAMED}|$f|"; tail -n +1 -F "$f" 2>/dev/null & ;; esac
@@ -143,4 +170,18 @@ workflow:
                   tail -150 "$f" 2>/dev/null || true
                 done
                 [ "$RC" -eq 0 ] || { echo "cosmos-rl exited $RC"; exit "$RC"; }
+
+                # ---- log the trained policy checkpoint as a W&B model artifact (cosmos-rl is not HF Trainer,
+                # so WANDB_LOG_MODEL does not apply -> log it explicitly) ----
+                export WANDB_PROJECT="${WANDB_PROJECT:-alpamayo-osmo}"
+                python - <<'PY'
+                import os, wandb
+                out = os.path.join(os.environ["YOUR_HOME"], "rl_outputs")
+                run = wandb.init(project=os.environ.get("WANDB_PROJECT","alpamayo-osmo"), entity=os.environ.get("WANDB_ENTITY"), name="alpamayo-rl-smoke-policy", job_type="model")
+                art = wandb.Artifact("alpamayo-rl-smoke-policy", type="model")
+                art.add_dir(out) if os.path.isdir(out) and os.listdir(out) else print("[wandb] no rl_outputs to log:", out)
+                run.log_artifact(art)
+                run.finish()
+                print("[wandb] RL policy artifact logged from", out)
+                PY
                 echo "=== alpamayo1.x RL (GRPO) SMOKE DONE ==="
